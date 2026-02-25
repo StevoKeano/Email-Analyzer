@@ -1,0 +1,36 @@
+# Email data files – never commit these
+*.eml
+*.msg
+*.pst
+*.ost
+*.mbox
+
+# Common ignores for Python / data projects (adjust as needed)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# wierd project extensions for proprietary data.
+*.sqlite3
+*.metadata.json
+
+# If you have large data/analysis folders
+data/
+emails/
+chromadb/
+raw_emails/
+analysis_output/
