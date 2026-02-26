@@ -126,21 +126,27 @@ def create_embeddings(chunks):
     """Create embeddings using GPU-accelerated sentence-transformers"""
     model = get_embedding_model()
     
+    # Handle DataParallel wrapper
+    if isinstance(model, torch.nn.DataParallel):
+        model_base = model.module
+    else:
+        model_base = model
+    
     total = len(chunks)
-    print(f"Creating embeddings with BAAI/bge-large-en-v1.5 (GPU)...")
+    print(f"Creating embeddings with BAAI/bge-large-en-v1.5 ({torch.cuda.device_count()} GPUs)...")
     
     # Extract texts, truncating to 512 chars for efficiency
     texts = [str(chunk['text'])[:512] if chunk['text'] else "" for chunk in chunks]
     
     start_time = time.time()
     
-    # Process in batches on GPU
-    batch_size = 256
+    # Larger batch size for multi-GPU
+    batch_size = 512 if torch.cuda.device_count() > 1 else 256
     all_embeddings = []
     
     for i in range(0, total, batch_size):
         batch_texts = texts[i:i+batch_size]
-        embeddings = model.encode(batch_texts, batch_size=batch_size, show_progress_bar=False)
+        embeddings = model.encode(batch_texts, batch_size=len(batch_texts), show_progress_bar=False, convert_to_numpy=True)
         all_embeddings.extend(embeddings.tolist())
         
         # Progress update
@@ -164,7 +170,7 @@ def create_embeddings(chunks):
 def get_query_embedding(text: str) -> List[float]:
     """Get embedding for a query string"""
     model = get_embedding_model()
-    embedding = model.encode([text], show_progress_bar=False)
+    embedding = model.encode([text], show_progress_bar=False, convert_to_numpy=True)
     return embedding.tolist()[0]
 
 def init_chroma():
