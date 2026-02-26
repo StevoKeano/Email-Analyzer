@@ -1,17 +1,40 @@
 import os
+import time
 from typing import List, Dict, Optional
 from pathlib import Path
 import email.parser
 from pydantic import BaseModel
 import chromadb
-import requests
+import numpy as np
+import torch
 
 # Configuration
 EMAIL_DIR = 'C:/Users/steve/projects/email-case-rag/emails'
 GEN_MODEL_NAME = 'qwen3.5-122b'  # Ollama model for generation (local)
-EMBEDDING_MODEL_NAME = 'nomic-embed-text'  # Ollama embedding model (local, GPU-enabled)
 CHROMA_DIR = 'C:/Users/steve/projects/email-case-rag/chromadb'
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+# Embedding model - using sentence-transformers with MULTI-GPU
+EMBEDDING_MODEL = None
+
+def get_embedding_model():
+    """Load sentence-transformers model with multi-GPU"""
+    global EMBEDDING_MODEL
+    if EMBEDDING_MODEL is None:
+        print("Loading embedding model (multi-GPU)...")
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cuda')
+        
+        # Use multiple GPUs if available
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs!")
+            from torch.nn import DataParallel
+            model = DataParallel(model)
+            model = model.cuda()
+        
+        EMBEDDING_MODEL = model
+        print(f"Embedding model loaded on {torch.cuda.device_count()} GPU(s)")
+    return EMBEDDING_MODEL
 
 class EmailMeta(BaseModel):
     email_id: str
@@ -20,23 +43,6 @@ class EmailMeta(BaseModel):
     to: List[str]
     date: str
     content: str
-
-def get_embedding(text: str) -> Optional[List[float]]:
-    """Get embedding from local Ollama model"""
-    max_chars = 4000
-    if len(text) > max_chars:
-        text = text[:max_chars]
-    try:
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
-            json={"model": EMBEDDING_MODEL_NAME, "prompt": text},
-            timeout=60
-        )
-        if response.status_code != 200:
-            return None
-        return response.json()["embedding"]
-    except:
-        return None
 
 def parse_email(file_path) -> Dict:
     """Parse email file and extract clean content"""
@@ -116,45 +122,50 @@ def chunk_text(emails: List[Dict], chunk_size=1000):
             })
     return chunks
 
-import time
-import concurrent.futures
-
 def create_embeddings(chunks):
-    """Create embeddings using local Ollama model - parallel requests"""
-    print(f"Creating embeddings with {EMBEDDING_MODEL_NAME}...")
+    """Create embeddings using GPU-accelerated sentence-transformers"""
+    model = get_embedding_model()
     
     total = len(chunks)
-    completed = 0
+    print(f"Creating embeddings with BAAI/bge-large-en-v1.5 (GPU)...")
+    
+    # Extract texts, truncating to 512 chars for efficiency
+    texts = [str(chunk['text'])[:512] if chunk['text'] else "" for chunk in chunks]
+    
     start_time = time.time()
-    last_print = start_time
     
-    def process_chunk(chunk):
-        text = str(chunk['text']) if chunk['text'] else ""
-        chunk['embedding'] = get_embedding(text)
-        return chunk
+    # Process in batches on GPU
+    batch_size = 256
+    all_embeddings = []
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-        futures = {executor.submit(process_chunk, chunk): i for i, chunk in enumerate(chunks)}
+    for i in range(0, total, batch_size):
+        batch_texts = texts[i:i+batch_size]
+        embeddings = model.encode(batch_texts, batch_size=batch_size, show_progress_bar=False)
+        all_embeddings.extend(embeddings.tolist())
         
-        results = [None] * total
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
-            results[idx] = future.result()
-            completed += 1
-            
-            # Print progress every 5 seconds
-            now = time.time()
-            if now - last_print >= 5:
-                elapsed = now - start_time
-                rate = completed / elapsed if elapsed > 0 else 0
-                eta = (total - completed) / rate if rate > 0 else 0
-                print(f"  Progress: {completed}/{total} ({rate:.1f}/sec, ETA: {eta/60:.1f} min)")
-                last_print = now
+        # Progress update
+        done = min(i + batch_size, total)
+        elapsed = time.time() - start_time
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / rate if rate > 0 else 0
+        print(f"  Progress: {done}/{total} ({rate:.0f}/sec, ETA: {eta/60:.1f} min)", end='\r')
     
-    valid_chunks = [c for c in results if c['embedding'] and sum(c['embedding']) != 0]
+    print()  # New line after progress
+    
+    # Attach embeddings to chunks
+    for i, chunk in enumerate(chunks):
+        chunk['embedding'] = all_embeddings[i]
+    
+    valid_chunks = [c for c in chunks if c['embedding'] and sum(c['embedding']) != 0]
     elapsed = time.time() - start_time
-    print(f"  Created {len(valid_chunks)} embeddings in {elapsed:.1f}s ({len(valid_chunks)/elapsed:.1f}/sec)")
+    print(f"  Created {len(valid_chunks)} embeddings in {elapsed:.1f}s ({len(valid_chunks)/elapsed:.0f}/sec)")
     return valid_chunks
+
+def get_query_embedding(text: str) -> List[float]:
+    """Get embedding for a query string"""
+    model = get_embedding_model()
+    embedding = model.encode([text], show_progress_bar=False)
+    return embedding.tolist()[0]
 
 def init_chroma():
     chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -164,7 +175,6 @@ def init_chroma():
 def index_emails(chunks):
     collection, _ = init_chroma()
     
-    # ChromaDB has a max batch size, so we need to batch
     batch_size = 5000
     total = len(chunks)
     
@@ -183,8 +193,7 @@ def index_emails(chunks):
         print(f"  Indexed {min(i+batch_size, total)}/{total}")
 
 def query_emails(prompt, collection):
-    # Get embedding for query using local Ollama
-    query_embedding = get_embedding(prompt)
+    query_embedding = get_query_embedding(prompt)
     
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -193,7 +202,6 @@ def query_emails(prompt, collection):
     
     context = "\n".join(results.get('documents', [[]])[0])
     
-    # Use Ollama via OpenAI-compatible API for generation
     import openai
     client = openai.OpenAI(base_url=f"{OLLAMA_BASE_URL}/v1", api_key="ollama")
     
@@ -207,7 +215,6 @@ def query_emails(prompt, collection):
     return response.choices[0].message.content
 
 def main():
-    # Initialize ChromaDB and check if already indexed
     collection, chroma_client = init_chroma()
     
     try:
@@ -218,18 +225,14 @@ def main():
     except:
         pass
     
-    # Load and parse emails
     emails = load_emails()
     print(f"Loaded {len(emails)} emails")
     
-    # Chunk texts into pieces
     text_chunks = chunk_text(emails)
     print(f"Created {len(text_chunks)} chunks")
     
-    # Create embeddings for chunks (using local Ollama)
     with_embeddings = create_embeddings(text_chunks)
     
-    # Index the emails in ChromaDB
     print("Indexing emails...")
     index_emails(with_embeddings)
     print("Indexing complete!")
