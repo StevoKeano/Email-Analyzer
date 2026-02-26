@@ -18,21 +18,13 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 EMBEDDING_MODEL = None
 
 def get_embedding_model():
-    """Load sentence-transformers model with multi-GPU"""
+    """Load sentence-transformers model with GPU"""
     global EMBEDDING_MODEL
     if EMBEDDING_MODEL is None:
-        print("Loading embedding model (multi-GPU)...")
+        print("Loading embedding model (GPU)...")
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer('BAAI/bge-large-en-v1.5', device='cuda')
-        
-        # Use multiple GPUs if available
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs!")
-            from torch.nn import DataParallel
-            model = DataParallel(model)
-            model = model.cuda()
-        
-        EMBEDDING_MODEL = model
+        EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0')
+        print("Embedding model loaded on GPU")
         print(f"Embedding model loaded on {torch.cuda.device_count()} GPU(s)")
     return EMBEDDING_MODEL
 
@@ -125,23 +117,16 @@ def chunk_text(emails: List[Dict], chunk_size=1000):
 def create_embeddings(chunks):
     """Create embeddings using GPU-accelerated sentence-transformers"""
     model = get_embedding_model()
-    
-    # Handle DataParallel wrapper
-    if isinstance(model, torch.nn.DataParallel):
-        model_base = model.module
-    else:
-        model_base = model
-    
     total = len(chunks)
-    print(f"Creating embeddings with BAAI/bge-large-en-v1.5 ({torch.cuda.device_count()} GPUs)...")
+    print(f"Creating embeddings with all-MiniLM-L6-v2 (GPU)...")
     
     # Extract texts, truncating to 512 chars for efficiency
     texts = [str(chunk['text'])[:512] if chunk['text'] else "" for chunk in chunks]
     
     start_time = time.time()
     
-    # Larger batch size for multi-GPU
-    batch_size = 512 if torch.cuda.device_count() > 1 else 256
+    # Batch size
+    batch_size = 512
     all_embeddings = []
     
     for i in range(0, total, batch_size):
