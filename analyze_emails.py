@@ -8,10 +8,10 @@ import requests
 
 # Configuration
 EMAIL_DIR = 'C:/Users/steve/projects/email-case-rag/emails'
-GEN_MODEL_NAME = 'qwen2.5:14b'  # Ollama model for generation (local)
-EMBEDDING_MODEL_NAME = 'mxbai-embed-large'  # Ollama embedding model (local)
+GEN_MODEL_NAME = 'qwen3.5-122b'  # Ollama model for generation (local)
+EMBEDDING_MODEL_NAME = 'nomic-embed-text'  # Ollama embedding model (local, GPU-enabled)
 CHROMA_DIR = 'C:/Users/steve/projects/email-case-rag/chromadb'
-OLLAMA_BASE_URL = "http://172.22.224.1:11434"
+OLLAMA_BASE_URL = "http://localhost:11434"
 
 class EmailMeta(BaseModel):
     email_id: str
@@ -23,7 +23,6 @@ class EmailMeta(BaseModel):
 
 def get_embedding(text: str) -> Optional[List[float]]:
     """Get embedding from local Ollama model"""
-    # Truncate text to avoid context length errors (mxbai-embed-large supports ~8192 tokens, use 4000 chars as safe limit)
     max_chars = 4000
     if len(text) > max_chars:
         text = text[:max_chars]
@@ -31,7 +30,7 @@ def get_embedding(text: str) -> Optional[List[float]]:
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/embeddings",
             json={"model": EMBEDDING_MODEL_NAME, "prompt": text},
-            timeout=30
+            timeout=60
         )
         if response.status_code != 200:
             return None
@@ -40,20 +39,59 @@ def get_embedding(text: str) -> Optional[List[float]]:
         return None
 
 def parse_email(file_path) -> Dict:
+    """Parse email file and extract clean content"""
     with open(file_path, 'rb') as f:
-        e = email.parser.BytesParser().parsebytes(f.read())
-        content = e.get_payload()
-        if not isinstance(content, str):
-            # Handle multipart messages
-            content = str(content) if content else ""
-        return {
-            "email_id": os.path.basename(file_path),
-            "subject": e['subject'] or "",
-            "from_": e.get('from') or "",
-            "to": e.get_all('to', []),
-            "date": e['date'] or "",
-            "content": content
-        }
+        msg = email.message_from_bytes(f.read())
+    
+    subject = msg['subject'] or ""
+    from_addr = msg['from'] or ""
+    to_addrs = msg.get_all('to', [])
+    date = msg['date'] or ""
+    
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            if content_type == 'text/plain':
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        body = payload.decode(charset, errors='ignore')
+                        break
+                except:
+                    pass
+        if not body:
+            for part in msg.walk():
+                if part.get_content_type() == 'text/html':
+                    try:
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            charset = part.get_content_charset() or 'utf-8'
+                            html = payload.decode(charset, errors='ignore')
+                            import re
+                            body = re.sub(r'<[^>]+>', ' ', html)
+                            body = re.sub(r'\s+', ' ', body)
+                            break
+                    except:
+                        pass
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or 'utf-8'
+                body = payload.decode(charset, errors='ignore')
+        except:
+            body = ""
+    
+    return {
+        "email_id": os.path.basename(file_path),
+        "subject": subject,
+        "from_": from_addr,
+        "to": to_addrs,
+        "date": date,
+        "content": body
+    }
 
 def load_emails() -> List[Dict]:
     emails = []
@@ -78,20 +116,44 @@ def chunk_text(emails: List[Dict], chunk_size=1000):
             })
     return chunks
 
+import time
+import concurrent.futures
+
 def create_embeddings(chunks):
-    """Create embeddings using local Ollama model"""
+    """Create embeddings using local Ollama model - parallel requests"""
     print(f"Creating embeddings with {EMBEDDING_MODEL_NAME}...")
-    for i, chunk in enumerate(chunks):
-        if i % 100 == 0:
-            print(f"  Progress: {i}/{len(chunks)}")
+    
+    total = len(chunks)
+    completed = 0
+    start_time = time.time()
+    last_print = start_time
+    
+    def process_chunk(chunk):
         text = str(chunk['text']) if chunk['text'] else ""
         chunk['embedding'] = get_embedding(text)
+        return chunk
     
-    # Filter out chunks with failed embeddings (all zeros)
-    valid_chunks = [c for c in chunks if c['embedding'] and sum(c['embedding']) != 0]
-    skipped = len(chunks) - len(valid_chunks)
-    if skipped > 0:
-        print(f"  Skipped {skipped} chunks with failed embeddings")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        futures = {executor.submit(process_chunk, chunk): i for i, chunk in enumerate(chunks)}
+        
+        results = [None] * total
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            results[idx] = future.result()
+            completed += 1
+            
+            # Print progress every 5 seconds
+            now = time.time()
+            if now - last_print >= 5:
+                elapsed = now - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (total - completed) / rate if rate > 0 else 0
+                print(f"  Progress: {completed}/{total} ({rate:.1f}/sec, ETA: {eta/60:.1f} min)")
+                last_print = now
+    
+    valid_chunks = [c for c in results if c['embedding'] and sum(c['embedding']) != 0]
+    elapsed = time.time() - start_time
+    print(f"  Created {len(valid_chunks)} embeddings in {elapsed:.1f}s ({len(valid_chunks)/elapsed:.1f}/sec)")
     return valid_chunks
 
 def init_chroma():
