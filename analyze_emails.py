@@ -10,9 +10,20 @@ import torch
 
 # Configuration
 EMAIL_DIR = 'C:/Users/steve/projects/email-case-rag/emails'
-GEN_MODEL_NAME = 'qwen3.5-122b'  # Ollama model for generation (local)
+GEN_MODEL_NAME = 'qwen2.5:14b'  # Ollama model for generation (local)
 CHROMA_DIR = 'C:/Users/steve/projects/email-case-rag/chromadb'
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+# Filter by ProtonMail label/folder (set to None to index all emails)
+# Set to a list of label IDs to filter by multiple folders
+FOLDER_LABEL_IDS = [
+    "dj1Oip_9lBDYQgxbFW9C8p9dishNOoOYb7_t8Iyv2RbsvpearIaOhRzKtUTcQaMl9FkcLNBtayJDMtiSz92Hbw==",  # TXAirlots
+    "yHZ4f0SyrjgzjY52EshijxzhJLMSQqlGRP2irkIfr4-MjPknNH6rCbWXKGX_ZKoIfkpowrZEeQB6bxc-qwhBmA==",  # Mediated Meeting
+    "jSQLfeMYhR2HefOGrfB3CbE6tB14rbkaZZz-CVP5mpAgE8PrnNslSqVkfkQEcyKArCcoE9YwjF0Z-1mHII6xiQ==",  # TXAirlots subfolder
+    "r9w4EZaVHzNmWXZCPCcAPX7yZvJkLm33TklAdsQqDUKqEWaJh7-h6-99oyVbscJ1n9GCy243hF91UsimjupOdg==",  # 1008 Group LLC
+    "vtaY4A6Gnbe0uUdjxPI0sQ8gZk_8zNmlIKyDS8eIIHT5aP1jxVf1wiDowuDySWfwhTxlE-p7m1qLnn8ulTHSYw==",  # Dorsett Johnson
+    "c_p_HlElp9k0zwR2lnuQhZ5wWs7hUMxl55DOKGYRdXsoUxL5v8OebHix4n5caL_4638vMMC5NQAXL-QuoTpW2w==",  # $46,781 deposit
+]
 
 # Embedding model - using sentence-transformers with MULTI-GPU
 EMBEDDING_MODEL = None
@@ -92,10 +103,36 @@ def parse_email(file_path) -> Dict:
     }
 
 def load_emails() -> List[Dict]:
+    import json
     emails = []
-    for file in Path(EMAIL_DIR).glob('*.eml'):
-        meta = parse_email(file)
+    email_files = list(Path(EMAIL_DIR).glob('*.eml'))
+    total = len(email_files)
+    print(f"Loading {total} emails...")
+    
+    for i, eml_file in enumerate(email_files):
+        # Check corresponding metadata file
+        metadata_file = eml_file.with_suffix('.metadata.json')
+        
+        if FOLDER_LABEL_IDS:
+            if not metadata_file.exists():
+                continue
+            try:
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                labels = metadata.get('Payload', {}).get('LabelIDs', [])
+                # Check if ANY of the folder IDs are in the email's labels
+                if not any(fid in labels for fid in FOLDER_LABEL_IDS):
+                    continue
+            except:
+                continue
+        
+        meta = parse_email(eml_file)
         emails.append(meta)
+        
+        if (i + 1) % 1000 == 0:
+            print(f"  Loaded {i + 1}/{total}")
+    
+    print(f"Loaded {len(emails)} emails (filtered by {len(FOLDER_LABEL_IDS)} folders)")
     return emails
 
 def chunk_text(emails: List[Dict], chunk_size=1000):
@@ -199,7 +236,7 @@ def query_emails(prompt, collection):
     response = client.chat.completions.create(
         model=GEN_MODEL_NAME,
         messages=[
-            {"role": "system", "content": "You are an impartial case analyst. Analyze the retrieved email context and answer the user's question. Highlight supporting statements (helpful/strengthening) and opposing statements (detrimental/harmful) with quotes and dates."},
+            {"role": "system", "content": "You are a legal case analyst. Analyze the retrieved email context and answer the user's question directly. Include relevant quotes, dates, and sender/recipient information when available."},
             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {prompt}"}
         ]
     )
@@ -237,7 +274,7 @@ if __name__ == "__main__":
     print("All data is processed locally. No data sent to the internet.\n")
     
     while True:
-        user_input = input("Query (type 'exit' to quit): ")
+        user_input = input("\033[91mQuery (type 'exit' to quit): \033[0m")
         if user_input.lower() == 'exit':
             break
         
